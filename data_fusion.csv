@@ -1,0 +1,17 @@
+C,metric,ms
+16,epilogue_unfused,0.0138
+16,epilogue_fused,0.008
+16,full_unfused,0.2363
+16,full_fused,0.226
+32,epilogue_unfused,0.0244
+32,epilogue_fused,0.0146
+32,full_unfused,1.0013
+32,full_fused,1.1011
+64,epilogue_unfused,0.0668
+64,epilogue_fused,0.0281
+64,full_unfused,4.543
+64,full_fused,4.3887
+128,epilogue_unfused,0.4506
+128,epilogue_fused,0.2545
+128,full_unfused,18.4241
+128,full_fused,18.0421

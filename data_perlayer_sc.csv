@@ -1,0 +1,13 @@
+layer,impl,ms
+Conv,custom,0.00925
+Conv,cudnn_fp32,0.03264
+Conv,cudnn_fp16,0.04274
+BN,custom,0.00618
+BN,cudnn_fp32,0.09326
+BN,cudnn_fp16,0.09567
+ReLU,custom,0.00581
+ReLU,cudnn_fp32,0.0076
+ReLU,cudnn_fp16,0.00698
+Pool,custom,0.00604
+Pool,cudnn_fp32,0.00934
+Pool,cudnn_fp16,0.00909
