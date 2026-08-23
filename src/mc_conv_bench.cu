@@ -14,6 +14,7 @@
 #include "error_check.h"
 #include "cudnn_convolution.h"
 #include <cuda_fp16.h>
+#include <cublas_v2.h>
 
 // ---- custom multi-channel naive convolution (valid, stride 1, no padding) ----
 __global__ void mc_naive_conv(const float* in, const float* filt, float* out,
@@ -69,6 +70,19 @@ __global__ void mc_tiled_conv(const float* in, const float* filt, float* out,
     }
     if (outX < Wout && outY < Hout)
         out[((size_t)co*Hout + outY)*Wout + outX] = sum;
+}
+
+// ---- im2col: unroll each Cin*R*S receptive field into a column of Col[K, P] ----
+// K = Cin*R*S (filter length), P = Hout*Wout (output positions). Row-major.
+__global__ void im2col(const float* in, float* col,
+                       int Cin, int H, int W, int R, int S, int Hout, int Wout) {
+    long idx = (long)blockIdx.x*blockDim.x + threadIdx.x;
+    long K = (long)Cin*R*S, P = (long)Hout*Wout;
+    if (idx >= K*P) return;
+    int k = (int)(idx / P), p = (int)(idx % P);
+    int ci = k/(R*S), rem = k%(R*S), ky = rem/S, kx = rem%S;
+    int oy = p/Wout,   ox = p%Wout;
+    col[idx] = in[((size_t)ci*H + (oy+ky))*W + (ox+kx)];
 }
 
 static void cpu_mc_conv(const float* in, const float* filt, float* out,
@@ -215,6 +229,32 @@ int main(int argc, char** argv) {
     cudaEventRecord(e); cudaEventSynchronize(e);
     float ms_cudnn16=0; cudaEventElapsedTime(&ms_cudnn16,s,e); ms_cudnn16/=IT;
 
+    // ---- im2col + cuBLAS SGEMM (convolution as one matrix multiply) ----
+    // cuBLAS is column-major; a row-major [r,c] buffer is a column-major [c,r] view.
+    // So Out^T[P,Cout] = Col^T[P,K] * Filter^T[K,Cout] with both ops = N gives our
+    // row-major Out[Cout,P]. NOTE: Col is materialized -> R*S x larger than the input.
+    int K = Cin*R*S, P = Hout*Wout;
+    float *d_col, *d_gemm;
+    CHECK_CUDA_ERR(cudaMalloc(&d_col,  (size_t)K*P*sizeof(float)));
+    CHECK_CUDA_ERR(cudaMalloc(&d_gemm, outN*sizeof(float)));
+    cublasHandle_t blas; cublasCreate(&blas);
+    float ga=1.0f, gb=0.0f;
+    int i2cT=256; long i2cB=((long)K*P + i2cT-1)/i2cT;
+    for (int i=0;i<WARM;i++) {
+        im2col<<<(unsigned)i2cB,i2cT>>>(d_in,d_col,Cin,H,W,R,S,Hout,Wout);
+        cublasSgemm(blas, CUBLAS_OP_N, CUBLAS_OP_N, P, Cout, K,
+                    &ga, d_col, P, d_filt, K, &gb, d_gemm, P);
+    }
+    CHECK_CUDA_ERR(cudaDeviceSynchronize());
+    cudaEventRecord(s);
+    for (int i=0;i<IT;i++) {
+        im2col<<<(unsigned)i2cB,i2cT>>>(d_in,d_col,Cin,H,W,R,S,Hout,Wout);
+        cublasSgemm(blas, CUBLAS_OP_N, CUBLAS_OP_N, P, Cout, K,
+                    &ga, d_col, P, d_filt, K, &gb, d_gemm, P);
+    }
+    cudaEventRecord(e); cudaEventSynchronize(e);
+    float ms_i2c=0; cudaEventElapsedTime(&ms_i2c,s,e); ms_i2c/=IT;
+
     printf("Multi-channel conv  Cin=%d Cout=%d  %dx%d  3x3\n", Cin, Cout, H, W);
     printf("  naive : %8.4f ms\n", ms_naive);
     printf("  tiled : %8.4f ms   (naive/tiled = %.2fx)\n", ms_tiled, ms_naive/ms_tiled);
@@ -222,9 +262,12 @@ int main(int argc, char** argv) {
            ms_cudnn, ms_naive/ms_cudnn, ms_tiled/ms_cudnn);
     printf("  cuDNN16:%8.4f ms   (FP32/FP16 = %.2fx  <- >1 means Tensor Cores help)\n",
            ms_cudnn16, ms_cudnn/ms_cudnn16);
+    printf("  im2col: %8.4f ms   (naive/im2col = %.2fx, im2col/cuDNN = %.2fx)\n",
+           ms_i2c, ms_naive/ms_i2c, ms_i2c/ms_cudnn);
     check(d_naive, h_gpu, h_cpu, outN, "naive");
     check(d_tiled, h_gpu, h_cpu, outN, "tiled");
     check(d_cudnn, h_gpu, h_cpu, outN, "cuDNN");
     check16(d_cudnn16, h_gpu16, h_gpu, h_cpu, outN, "cuDNN16");
+    check(d_gemm, h_gpu, h_cpu, outN, "im2col");
     return 0;
 }
