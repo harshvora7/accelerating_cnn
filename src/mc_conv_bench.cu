@@ -13,6 +13,7 @@
 #include <cudnn.h>
 #include "error_check.h"
 #include "cudnn_convolution.h"
+#include <cuda_fp16.h>
 
 // ---- custom multi-channel naive convolution (valid, stride 1, no padding) ----
 __global__ void mc_naive_conv(const float* in, const float* filt, float* out,
@@ -102,6 +103,21 @@ static void check(float* d_out, float* h_gpu, const float* h_cpu,
            name, max_abs, rel_l2, rel_l2 < 1e-3 ? "PASS" : "MISMATCH");
 }
 
+static void check16(__half* d_out, __half* h_gpu16, float* h_gpu, const float* h_cpu,
+                    size_t outN, const char* name) {
+    CHECK_CUDA_ERR(cudaMemcpy(h_gpu16, d_out, outN*sizeof(__half), cudaMemcpyDeviceToHost));
+    for (size_t i = 0; i < outN; ++i) h_gpu[i] = __half2float(h_gpu16[i]);
+    double max_abs = 0.0, num = 0.0, den = 0.0;
+    for (size_t i = 0; i < outN; ++i) {
+        double d = (double)h_cpu[i] - (double)h_gpu[i];
+        if (fabs(d) > max_abs) max_abs = fabs(d);
+        num += d*d; den += (double)h_cpu[i]*(double)h_cpu[i];
+    }
+    double rel_l2 = sqrt(num) / (sqrt(den) + 1e-12);
+    printf("  %-6s max_abs=%.3e  rel_L2=%.3e  %s\n",
+           name, max_abs, rel_l2, rel_l2 < 1e-2 ? "PASS" : "MISMATCH");  // looser tol for FP16
+}
+
 static int argi(int argc, char** argv, const char* key, int defv) {
     for (int i = 1; i < argc; ++i)
         if (strncmp(argv[i], key, strlen(key)) == 0)
@@ -133,6 +149,18 @@ int main(int argc, char** argv) {
     CHECK_CUDA_ERR(cudaMalloc(&d_cudnn, outN*sizeof(float)));
     CHECK_CUDA_ERR(cudaMemcpy(d_in,   h_in,   inN*sizeof(float),   cudaMemcpyHostToDevice));
     CHECK_CUDA_ERR(cudaMemcpy(d_filt, h_filt, filtN*sizeof(float), cudaMemcpyHostToDevice));
+
+    // FP16 buffers (host conversion + device copies)
+    __half *h_in16=(__half*)malloc(inN*sizeof(__half)), *h_filt16=(__half*)malloc(filtN*sizeof(__half));
+    __half *h_gpu16=(__half*)malloc(outN*sizeof(__half));
+    for (size_t i=0;i<inN;i++)   h_in16[i]   = __float2half(h_in[i]);
+    for (size_t i=0;i<filtN;i++) h_filt16[i] = __float2half(h_filt[i]);
+    __half *d_in16,*d_filt16,*d_cudnn16;
+    CHECK_CUDA_ERR(cudaMalloc(&d_in16,    inN*sizeof(__half)));
+    CHECK_CUDA_ERR(cudaMalloc(&d_filt16,  filtN*sizeof(__half)));
+    CHECK_CUDA_ERR(cudaMalloc(&d_cudnn16, outN*sizeof(__half)));
+    CHECK_CUDA_ERR(cudaMemcpy(d_in16,   h_in16,   inN*sizeof(__half),   cudaMemcpyHostToDevice));
+    CHECK_CUDA_ERR(cudaMemcpy(d_filt16, h_filt16, filtN*sizeof(__half), cudaMemcpyHostToDevice));
 
     dim3 block(16,16,1), grid((Wout+15)/16, (Hout+15)/16, Cout);
     const int WARM=5, IT=50;
@@ -174,13 +202,29 @@ int main(int argc, char** argv) {
     cudaEventRecord(e); cudaEventSynchronize(e);
     float ms_cudnn=0; cudaEventElapsedTime(&ms_cudnn,s,e); ms_cudnn/=IT;
 
+    // ---- cuDNN FP16 (Tensor Cores engage when channels are multiples of 8) ----
+    cudnnTensorDescriptor_t inDesc16,outDesc16; cudnnFilterDescriptor_t filtDesc16;
+    cudnnConvolutionDescriptor_t convDesc16; cudnnConvolutionFwdAlgo_t algo16;
+    void* ws16=nullptr; size_t wsSize16=0;
+    cudnn_convolution_setup_fp16(cudnn, inDims, filtDims, outDims, 0,0,1,1,
+        &inDesc16,&filtDesc16,&convDesc16,&outDesc16,&algo16,&ws16,&wsSize16);
+    for (int i=0;i<WARM;i++) cudnn_convolution_forward_fp16(cudnn,inDesc16,filtDesc16,convDesc16,outDesc16,algo16,ws16,wsSize16,d_in16,d_filt16,d_cudnn16,1.0f,0.0f);
+    CHECK_CUDA_ERR(cudaDeviceSynchronize());
+    cudaEventRecord(s);
+    for (int i=0;i<IT;i++)   cudnn_convolution_forward_fp16(cudnn,inDesc16,filtDesc16,convDesc16,outDesc16,algo16,ws16,wsSize16,d_in16,d_filt16,d_cudnn16,1.0f,0.0f);
+    cudaEventRecord(e); cudaEventSynchronize(e);
+    float ms_cudnn16=0; cudaEventElapsedTime(&ms_cudnn16,s,e); ms_cudnn16/=IT;
+
     printf("Multi-channel conv  Cin=%d Cout=%d  %dx%d  3x3\n", Cin, Cout, H, W);
     printf("  naive : %8.4f ms\n", ms_naive);
     printf("  tiled : %8.4f ms   (naive/tiled = %.2fx)\n", ms_tiled, ms_naive/ms_tiled);
     printf("  cuDNN : %8.4f ms   (naive/cuDNN = %.2fx, tiled/cuDNN = %.2fx)\n",
            ms_cudnn, ms_naive/ms_cudnn, ms_tiled/ms_cudnn);
+    printf("  cuDNN16:%8.4f ms   (FP32/FP16 = %.2fx  <- >1 means Tensor Cores help)\n",
+           ms_cudnn16, ms_cudnn/ms_cudnn16);
     check(d_naive, h_gpu, h_cpu, outN, "naive");
     check(d_tiled, h_gpu, h_cpu, outN, "tiled");
     check(d_cudnn, h_gpu, h_cpu, outN, "cuDNN");
+    check16(d_cudnn16, h_gpu16, h_gpu, h_cpu, outN, "cuDNN16");
     return 0;
 }
