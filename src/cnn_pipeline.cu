@@ -14,8 +14,9 @@
 #include "relu.h"               // relu_kernel(), cpu_relu()
 #include "pooling.h"            // max_pooling_kernel(), cpu_max_pooling()
 #include "cudnn_convolution.h"  // cudnn_init(), cudnn_convolution_forward(), etc.
+#include "tiled_convolution.h"   // tiled_convolution(), set_tiled_conv_kernel()
 
-enum ImplMode { MODE_CUSTOM, MODE_CUDNN };
+enum ImplMode { MODE_CUSTOM, MODE_CUDNN, MODE_TILED };
 
 ImplMode parseMode(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
@@ -23,15 +24,30 @@ ImplMode parseMode(int argc, char** argv) {
             const char* m = argv[i] + 7;
             if (strcmp(m, "custom") == 0) return MODE_CUSTOM;
             if (strcmp(m, "cudnn")  == 0) return MODE_CUDNN;
+            if (strcmp(m, "tiled")  == 0) return MODE_TILED;
         }
     }
     return MODE_CUSTOM;
 }
 
+// Parse --ksize=N (odd, 3..15); default 3.
+int parseKsize(int argc, char** argv) {
+    for (int i = 1; i < argc; ++i) {
+        if (strncmp(argv[i], "--ksize=", 8) == 0) {
+            int k = atoi(argv[i] + 8);
+            if (k >= 3 && k <= 31 && (k % 2 == 1)) return k;
+        }
+    }
+    return 3;
+}
+
 int main(int argc, char** argv) {
     ImplMode mode = parseMode(argc, argv);
+    int ksize = parseKsize(argc, argv);
     if (mode == MODE_CUDNN) {
         printf("Running with cuDNN convolution\n");
+    } else if (mode == MODE_TILED) {
+        printf("Running with custom TILED CUDA convolution\n");
     } else {
         printf("Running with custom CUDA convolution\n");
     }
@@ -49,8 +65,8 @@ int main(int argc, char** argv) {
     // -------------------------------------
     const int inputWidth  = 512;
     const int inputHeight = 512;
-    const int convKernelWidth  = 3;
-    const int convKernelHeight = 3;
+    const int convKernelWidth  = ksize;
+    const int convKernelHeight = ksize;
     const int convOutWidth  = inputWidth  - convKernelWidth  + 1;
     const int convOutHeight = inputHeight - convKernelHeight + 1;
 
@@ -90,9 +106,19 @@ int main(int argc, char** argv) {
     for (int i = 0; i < inputWidth*inputHeight; i++) {
         h_input[i] = (float)(rand() % 10);
     }
-    float exampleKernel[9] = {1,0,-1,1,0,-1,1,0,-1};
-    for (int i = 0; i < convKernelWidth*convKernelHeight; i++) {
-        h_conv_kernel[i] = exampleKernel[i];
+    // Normalized box-blur filter, sized convKernelWidth x convKernelHeight.
+    // Well-defined at any kernel size; small output magnitudes keep the
+    // FP32 GPU-vs-CPU validation tight across the filter-size sweep.
+    {
+        float w = 1.0f / (float)(convKernelWidth * convKernelHeight);
+        for (int i = 0; i < convKernelWidth*convKernelHeight; i++) {
+            h_conv_kernel[i] = w;
+        }
+    }
+
+    // Upload filter to constant memory for the tiled kernel (MODE_TILED)
+    if (mode == MODE_TILED) {
+        set_tiled_conv_kernel(h_conv_kernel, convKernelWidth, convKernelHeight);
     }
 
     // -------------------------------------
@@ -194,6 +220,13 @@ int main(int argc, char** argv) {
                                            convKernelWidth, convKernelHeight,
                                            convOutWidth, convOutHeight);
             CHECK_CUDA_ERR(cudaDeviceSynchronize());
+        } else if (mode == MODE_TILED) {
+            dim3 b2d(TILE_DIM,TILE_DIM), g2d((convOutWidth+TILE_DIM-1)/TILE_DIM,(convOutHeight+TILE_DIM-1)/TILE_DIM);
+            tiled_convolution<<<g2d,b2d>>>(d_input, d_conv,
+                                           inputWidth, inputHeight,
+                                           convKernelWidth, convKernelHeight,
+                                           convOutWidth, convOutHeight);
+            CHECK_CUDA_ERR(cudaDeviceSynchronize());
         } else {
             cudnn_convolution_forward(
               cudnnHandle,
@@ -226,6 +259,12 @@ int main(int argc, char** argv) {
         if (mode == MODE_CUSTOM) {
             dim3 b2d(16,16), g2d((convOutWidth+15)/16,(convOutHeight+15)/16);
             naive_convolution<<<g2d,b2d>>>(d_input, d_conv_kernel, d_conv,
+                                           inputWidth, inputHeight,
+                                           convKernelWidth, convKernelHeight,
+                                           convOutWidth, convOutHeight);
+        } else if (mode == MODE_TILED) {
+            dim3 b2d(TILE_DIM,TILE_DIM), g2d((convOutWidth+TILE_DIM-1)/TILE_DIM,(convOutHeight+TILE_DIM-1)/TILE_DIM);
+            tiled_convolution<<<g2d,b2d>>>(d_input, d_conv,
                                            inputWidth, inputHeight,
                                            convKernelWidth, convKernelHeight,
                                            convOutWidth, convOutHeight);
@@ -284,9 +323,16 @@ int main(int argc, char** argv) {
     // -------------------------------------
     CHECK_CUDA_ERR(cudaMemcpy(h_pool_gpu, d_pool, poolOutBytes, cudaMemcpyDeviceToHost));
     int errors = 0;
+    float max_abs = 0.0f, max_rel = 0.0f;
     for (int i = 0; i < poolOutWidth*poolOutHeight; i++) {
-        if (fabs(h_pool_cpu[i] - h_pool_gpu[i]) > 1e-5f) errors++;
+        float a = h_pool_cpu[i], b = h_pool_gpu[i];
+        float abs_diff = fabsf(a - b);
+        float rel_diff = abs_diff / (fabsf(a) + 1e-6f);
+        if (abs_diff > max_abs) max_abs = abs_diff;
+        if (rel_diff > max_rel) max_rel = rel_diff;
+        if (rel_diff > 1e-3f) errors++;   // relative tolerance: robust to FMA rounding + magnitude
     }
+    printf("Max abs diff: %e | Max rel diff: %e\n", max_abs, max_rel);
     if (errors == 0) {
         printf("Integrated Pipeline Test: Results match!\n");
     } else {

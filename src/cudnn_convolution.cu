@@ -146,7 +146,8 @@ void cudnn_convolution_setup_fp16(
     CHECK_CUDNN(cudnnSetConvolution2dDescriptor(
         *convDesc, padH, padW, strideH, strideW,
         /*dilationH=*/1, /*dilationW=*/1,
-        CUDNN_CROSS_CORRELATION, CUDNN_DATA_HALF));
+        CUDNN_CROSS_CORRELATION, CUDNN_DATA_FLOAT));
+    CHECK_CUDNN(cudnnSetConvolutionMathType(*convDesc, CUDNN_TENSOR_OP_MATH));
 
     // Pick best algorithm
     const int maxAlgos = CUDNN_CONVOLUTION_FWD_ALGO_COUNT;
@@ -179,9 +180,9 @@ void cudnn_convolution_forward_fp16(
     float alpha_f,
     float beta_f)
 {
-    // convert float scalars to half
-    __half alpha = __float2half(alpha_f);
-    __half beta  = __float2half(beta_f);
+    // cuDNN requires FP32 alpha/beta scalars even when tensors are FP16
+    float alpha = alpha_f;
+    float beta  = beta_f;
 
     CHECK_CUDNN(cudnnConvolutionForward(
         handle,

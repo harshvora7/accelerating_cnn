@@ -20,6 +20,7 @@ OBJ_DIR := obj
 # Custom‐CUDA helper sources (no mains)
 CUSTOM_SRCS := \
     cuda_convolution.cu \
+    tiled_convolution.cu \
     batch_norm.cu      \
     relu.cu            \
     pooling.cu

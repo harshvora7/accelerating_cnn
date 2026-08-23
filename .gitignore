@@ -1,0 +1,10 @@
+obj/
+cnn_pipeline
+cudnn_pipeline
+mc_conv_bench
+image_demo
+*.o
+*.jpg
+input_gray.png
+edges.png
+__pycache__/

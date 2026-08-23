@@ -105,8 +105,8 @@ void cudnn_relu_forward_fp16(
     __half*             d_output_fp16)
 {
     // cuDNN expects alpha/beta pointers that match tensor data type
-    __half alpha = __float2half(1.0f);
-    __half beta  = __float2half(0.0f);
+    float alpha = 1.0f;   // cuDNN wants FP32 alpha/beta even for FP16 tensors
+    float beta  = 0.0f;
     CHECK_CUDNN(cudnnActivationForward(
         handle,
         ctx->actDesc,

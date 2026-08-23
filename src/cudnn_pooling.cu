@@ -132,8 +132,8 @@ void cudnn_pooling_forward_fp16(
     const __half*       d_input,
     __half*             d_output)
 {
-    __half alpha = __float2half(1.0f);
-    __half beta  = __float2half(0.0f);
+    float alpha = 1.0f;   // cuDNN wants FP32 alpha/beta even for FP16 tensors
+    float beta  = 0.0f;
     CHECK_CUDNN(cudnnPoolingForward(
         handle,
         ctx->poolDesc,

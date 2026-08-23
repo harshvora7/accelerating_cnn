@@ -235,7 +235,7 @@ int main() {
       CHECK_CUDA_ERR(cudaEventSynchronize(e2));
       { float t; CHECK_CUDA_ERR(cudaEventElapsedTime(&t,s2,e2)); total_relu32 += t; }
 
-      FP16 ReLU
+      // FP16 ReLU
       CHECK_CUDA_ERR(cudaEventRecord(s2_16,0));
       cudnn_relu_forward_fp16(cudnn, reluCtx16, d_bn16, d_relu16);
       CHECK_CUDA_ERR(cudaEventRecord(e2_16,0));
@@ -249,7 +249,7 @@ int main() {
       CHECK_CUDA_ERR(cudaEventSynchronize(e3));
       { float t; CHECK_CUDA_ERR(cudaEventElapsedTime(&t,s3,e3)); total_pool32 += t; }
 
-      FP16 Pool
+      // FP16 Pool
       CHECK_CUDA_ERR(cudaEventRecord(s3_16,0));
       cudnn_pooling_forward_fp16(cudnn, poolCtx16, d_relu16, d_pool16);
       CHECK_CUDA_ERR(cudaEventRecord(e3_16,0));
@@ -266,6 +266,27 @@ int main() {
     printf("  FP16  ReLU avg: %f ms\n", total_relu16/ITERS);
     printf("  FP32  Pool avg: %f ms\n", total_pool32/ITERS);
     printf("  FP16  Pool avg: %f ms\n", total_pool16/ITERS);
+
+    // ---- FP16 correctness: FP16 pipeline output vs FP32 CPU reference ----
+    int poolCount = N*C*H_pool*W_pool;
+    __half* h_pool16 = (__half*)malloc(poolCount * sizeof(__half));
+    CHECK_CUDA_ERR(cudaMemcpy(h_pool16, d_pool16, poolCount * sizeof(__half),
+                              cudaMemcpyDeviceToHost));
+    int   fp16_errors = 0;
+    float fp16_max_abs = 0.0f, fp16_max_rel = 0.0f;
+    for (int i = 0; i < poolCount; i++) {
+        float ref = h_pool[i];                  // FP32 CPU reference
+        float got = __half2float(h_pool16[i]);  // FP16 GPU result -> float
+        float abs_diff = fabsf(ref - got);
+        float rel_diff = abs_diff / (fabsf(ref) + 1e-6f);
+        if (abs_diff > fp16_max_abs) fp16_max_abs = abs_diff;
+        if (rel_diff > fp16_max_rel) fp16_max_rel = rel_diff;
+        if (rel_diff > 2e-2f) fp16_errors++;    // FP16 ~3 decimal digits -> looser tol than FP32
+    }
+    printf("\n  FP16 vs FP32-CPU -> Max abs: %e | Max rel: %e\n", fp16_max_abs, fp16_max_rel);
+    printf(fp16_errors == 0 ? "  FP16 Correctness: PASS (within 2e-2 relative)\n"
+                            : "  FP16 Correctness: %d values exceed 2e-2 rel tol\n", fp16_errors);
+    free(h_pool16);
     // Destroy pooling contexts
     cudnn_pooling_destroy(poolCtx32);
     cudnn_pooling_destroy_fp16(poolCtx16);
@@ -315,8 +336,6 @@ int main() {
     free(h_relu);  free(h_pool);
 
     free(h_in16);   free(h_kern16);
-    free(h_conv16); free(h_bn16);
-    free(h_relu16); free(h_pool16);
 
     // Destroy all CUDA events
     cudaEventDestroy(s0);      cudaEventDestroy(e0);
