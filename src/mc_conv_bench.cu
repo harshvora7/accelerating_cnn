@@ -85,6 +85,54 @@ __global__ void im2col(const float* in, float* col,
     col[idx] = in[((size_t)ci*H + (oy+ky))*W + (ox+kx)];
 }
 
+#define COARSEN 4
+// ---- output-channel-coarsened tiled convolution ----
+// Each thread computes COARSEN output channels from ONE shared input tile, so the
+// tile load (paid once per output channel by mc_tiled_conv) is amortized across
+// COARSEN channels -- recovering the input-reuse-across-output-channels that the
+// plain tiled kernel wasted. Grid-z = Cout/COARSEN. Assumes Cout % COARSEN == 0.
+__global__ void mc_coarsened_conv(const float* in, const float* filt, float* out,
+                                  int Cin, int Cout, int H, int W, int R, int S,
+                                  int Hout, int Wout) {
+    extern __shared__ float tile[];
+    const int tw = MC_TILE + S - 1, th = MC_TILE + R - 1;
+    const int tx = threadIdx.x, ty = threadIdx.y;
+    const int baseX = blockIdx.x * MC_TILE, baseY = blockIdx.y * MC_TILE;
+    const int co_base = blockIdx.z * COARSEN;
+    const int outX = baseX + tx, outY = baseY + ty;
+
+    float acc[COARSEN];
+    #pragma unroll
+    for (int j = 0; j < COARSEN; ++j) acc[j] = 0.0f;
+
+    for (int ci = 0; ci < Cin; ++ci) {
+        const float* inC = in + (size_t)ci * H * W;
+        for (int ly = ty; ly < th; ly += MC_TILE)              // load this channel's tile once
+            for (int lx = tx; lx < tw; lx += MC_TILE) {
+                int gx = baseX + lx, gy = baseY + ly;
+                tile[ly*tw + lx] = (gx < W && gy < H) ? inC[gy*W + gx] : 0.0f;
+            }
+        __syncthreads();
+        if (outX < Wout && outY < Hout) {
+            #pragma unroll
+            for (int j = 0; j < COARSEN; ++j) {                // reuse the ONE tile for COARSEN outputs
+                const float* fC = filt + ((size_t)(co_base + j) * Cin + ci) * R * S;
+                float sum = 0.0f;
+                for (int ky = 0; ky < R; ++ky)
+                    for (int kx = 0; kx < S; ++kx)
+                        sum += tile[(ty+ky)*tw + (tx+kx)] * fC[ky*S + kx];
+                acc[j] += sum;
+            }
+        }
+        __syncthreads();
+    }
+    if (outX < Wout && outY < Hout) {
+        #pragma unroll
+        for (int j = 0; j < COARSEN; ++j)
+            out[((size_t)(co_base + j) * Hout + outY) * Wout + outX] = acc[j];
+    }
+}
+
 static void cpu_mc_conv(const float* in, const float* filt, float* out,
                         int Cin, int Cout, int H, int W, int R, int S,
                         int Hout, int Wout) {
@@ -269,5 +317,24 @@ int main(int argc, char** argv) {
     check(d_cudnn, h_gpu, h_cpu, outN, "cuDNN");
     check16(d_cudnn16, h_gpu16, h_gpu, h_cpu, outN, "cuDNN16");
     check(d_gemm, h_gpu, h_cpu, outN, "im2col");
+
+    // ---- output-channel-coarsened tiled (multi-channel; needs Cout % COARSEN == 0) ----
+    if (Cout % COARSEN == 0) {
+        float *d_coarse; CHECK_CUDA_ERR(cudaMalloc(&d_coarse, outN*sizeof(float)));
+        int tw2 = MC_TILE + S - 1, th2 = MC_TILE + R - 1;
+        size_t shmem2 = (size_t)tw2*th2*sizeof(float);
+        dim3 gc((Wout+MC_TILE-1)/MC_TILE,(Hout+MC_TILE-1)/MC_TILE, Cout/COARSEN);
+        for (int i=0;i<WARM;i++) mc_coarsened_conv<<<gc,block,shmem2>>>(d_in,d_filt,d_coarse,Cin,Cout,H,W,R,S,Hout,Wout);
+        CHECK_CUDA_ERR(cudaDeviceSynchronize());
+        cudaEventRecord(s);
+        for (int i=0;i<IT;i++) mc_coarsened_conv<<<gc,block,shmem2>>>(d_in,d_filt,d_coarse,Cin,Cout,H,W,R,S,Hout,Wout);
+        cudaEventRecord(e); cudaEventSynchronize(e);
+        float ms_coarse=0; cudaEventElapsedTime(&ms_coarse,s,e); ms_coarse/=IT;
+        printf("  coarse: %8.4f ms   (naive/coarse = %.2fx, tiled/coarse = %.2fx, coarse/cuDNN = %.2fx)\n",
+               ms_coarse, ms_naive/ms_coarse, ms_tiled/ms_coarse, ms_coarse/ms_cudnn);
+        check(d_coarse, h_gpu, h_cpu, outN, "coarse");
+    } else {
+        printf("  coarse: skipped (Cout=%d not divisible by COARSEN=%d)\n", Cout, COARSEN);
+    }
     return 0;
 }
